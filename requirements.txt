@@ -1,0 +1,15 @@
+streamlit>=1.39
+pandas>=2.2
+geopandas>=1.0
+plotly>=5.24
+openai>=1.50
+pyarrow>=17.0
+shapely>=2.0
+fiona>=1.9
+pyogrio>=0.9
+scikit-learn>=1.5
+numpy>=1.26
+matplotlib>=3.8
+shap>=0.46
+jupyter>=1.0
+ipykernel>=6.29
