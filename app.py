@@ -19,8 +19,8 @@ st.set_page_config(
 # =========================
 # CONFIG
 # =========================
-DATA_FILE = "df_mhi_with_llm.parquet"
-GPKG_FILE = "municipalities_master.gpkg"
+DATA_FILE = "data/df_mhi_with_llm.parquet"
+GPKG_FILE = "data/municipalities_master.gpkg"
 GPKG_LAYER = None
 CREDS_FILE = "creds.json"
 
@@ -353,9 +353,6 @@ selected_from_sidebar = st.sidebar.selectbox(
 st.session_state["selected_muni"] = selected_from_sidebar
 
 show_data_table = st.sidebar.checkbox("Show data table", value=False)
-use_saved_llm = st.sidebar.checkbox(
-    "Use saved LLM summary if available", value=True)
-# zoom_to_selected = st.sidebar.checkbox("Zoom to selected municipality", value=True)
 
 # =========================
 # HEADER
@@ -720,20 +717,20 @@ with right:
             "This section explains which local factors had the strongest influence on the model result "
             "for this municipality. These are model signals, not proof that a landslide will happen."
         )
-
+        
+        
     st.subheader("Explanation")
 
     saved_summary = selected_row.get("llm_summary", None)
 
-    if use_saved_llm and pd.notna(saved_summary) and str(saved_summary).strip():
+    if pd.notna(saved_summary) and str(saved_summary).strip():
         st.info(saved_summary)
     else:
-        if st.button("Generate explanation"):
-            with st.spinner("Generating explanation..."):
+        if st.button("Generate plain-language summary"):
+            with st.spinner("Generating summary..."):
                 try:
                     llm_text = generate_llm_summary(selected_row)
-                    st.success("Done")
-                    st.write(llm_text)
+                    st.info(llm_text)
                 except Exception as e:
                     st.error(f"Generation failed: {e}")
 
