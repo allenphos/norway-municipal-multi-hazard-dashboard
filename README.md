@@ -1,6 +1,8 @@
 # Norway Municipal Multi-Hazard Dashboard
 
-This repository contains my bachelor project on municipal-scale multi-hazard screening in Norway. The project combines a model-based shallow landslide probability estimate, municipal flood exposure, and a relative multi-hazard index in an interactive Streamlit dashboard.
+This repository contains my bachelor project on municipal-scale multi-hazard screening in Norway . The project combines a model-based shallow landslide probability estimate, municipal flood exposure, and a relative multi-hazard index in an interactive Streamlit dashboard.
+
+Live app: https://norway-municipal-multi-hazard-dashboard-72rc6fzb6lrs9harg2vash.streamlit.app/
 
 The goal is not to predict exact future events for a specific location and time. Instead, the project provides a municipality-level screening view that helps compare relative patterns across Norway.
 
