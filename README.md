@@ -6,6 +6,8 @@ Live app: https://norway-municipal-multi-hazard-dashboard-72rc6fzb6lrs9harg2vash
 
 The goal is not to predict exact future events for a specific location and time. Instead, the project provides a municipality-level screening view that helps compare relative patterns across Norway.
 
+Note: If the app is sleeping, please click the “Wake up” button and allow a short moment for it to load.
+
 ## Project overview
 
 The project includes three main components:
@@ -24,7 +26,6 @@ The repository contains:
 - `notebooks/bachelor_multihazard_workflow.ipynb` — main analysis notebook
 - `data/df_mhi_with_llm.parquet` — processed municipality-level outputs
 - `data/municipalities_master.gpkg` — municipality geometry
-- figures, maps, and other project outputs if included
 
 ## Methods summary
 
@@ -54,12 +55,22 @@ The Streamlit app allows the user to:
 ├── README.md
 ├── .gitignore
 ├── data/
+│   ├── interim/
+│   │   ├── flood_feature.parquet
+│   │   ├── hydrology.parquet
+│   │   ├── model_dataset_loss_elev_slp_yi.parquet
+│   │   ├── model_features_clean.parquet
+│   │   ├── multihazard.parquet
+│   │   ├── municipalities_climate.parquet
+│   │   └── precipitations_municipalities.parquet
 │   ├── df_mhi_with_llm.parquet
 │   └── municipalities_master.gpkg
 ├── notebooks/
 │   └── bachelor_multihazard_workflow.ipynb
-└── images/
 ```
+The data/interim/ folder contains intermediate processed datasets used during feature construction and modelling workflow development.
+
+
 ## How to run locally
 
 Create and activate a virtual environment if needed, then install dependencies:
@@ -93,3 +104,5 @@ The dashboard is a screening tool. It does not provide event prediction, return 
 Anastasia Alyoshkina
 
 Bachelor project in Applied Data Science
+
+Noroff University College
