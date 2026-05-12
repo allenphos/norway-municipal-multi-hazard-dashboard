@@ -129,7 +129,6 @@ def fix_geometry_for_webmap(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
 def build_geojson(gdf: gpd.GeoDataFrame) -> dict:
     """
     Build GeoJSON safely using only columns needed for mapping.
-    Avoids Timestamp / mixed object serialization issues.
     """
     features = []
 
