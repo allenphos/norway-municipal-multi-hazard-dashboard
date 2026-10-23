@@ -1,52 +1,96 @@
 # Norway Municipal Multi-Hazard Dashboard
 
-This repository contains my bachelor project on municipal-scale multi-hazard screening in Norway . The project combines a model-based shallow landslide probability estimate, municipal flood exposure, and a relative multi-hazard index in an interactive Streamlit dashboard.
+An interactive, explainable multi-hazard screening framework for Norwegian municipalities, combining machine learning-based shallow landslide estimates, mapped flood exposure, and a relative multi-hazard index.
 
-Live app: https://norway-municipal-multi-hazard-dashboard-72rc6fzb6lrs9harg2vash.streamlit.app/
+**[Explore the Interactive Dashboard](https://norway-municipal-multi-hazard-dashboard-72rc6fzb6lrs9harg2vash.streamlit.app/)**
 
-The goal is not to predict exact future events for a specific location and time. Instead, the project provides a municipality-level screening view that helps compare relative patterns across Norway.
+*If the application is sleeping, click "Wake up" to start it.*
 
-Note: If the app is sleeping, please click the “Wake up” button and allow a short moment for it to load.
+## About the Project
 
-## Project overview
+This project originated as a Bachelor’s thesis in Applied Data Science at Noroff University College and was subsequently revised for the NIK 2026 research paper *Explainable Municipal Multi-Hazard Screening for Shallow Landslides and Floods in Norway*.
 
-The project includes three main components:
+The study investigates how environmental data and interpretable machine learning can support municipality-level hazard screening across Norway.
 
-- a machine learning model for shallow landslide probability at municipality level
-- a flood exposure indicator based on overlap with mapped flood caution areas
-- a combined relative multi-hazard index
+Rather than predicting when or where an individual disaster will occur, the framework identifies relative geographical patterns that may support preliminary screening and further investigation.
 
-The dashboard also includes plain-language explanations based on model outputs and local feature contributions.
+The final modelling dataset contains **355 Norwegian municipalities**.
 
-## Main outputs
+## Methodology
 
-The repository contains:
+### 1. Shallow Landslide Modelling
 
-- `app.py` — Streamlit dashboard
-- `notebooks/bachelor_multihazard_workflow.ipynb` — main analysis notebook
-- `data/df_mhi_with_llm.parquet` — processed municipality-level outputs
-- `data/municipalities_master.gpkg` — municipality geometry
+A calibrated HistGradientBoosting (HGB) classifier estimates municipality-level shallow landslide occurrence probability using environmental predictors, including:
 
-## Methods summary
+- Terrain characteristics and elevation
+- Surface deposits and geological conditions
+- Hydrological features
+- Climate and precipitation indicators
 
-The landslide component is based on a municipality-level classification framework using terrain, deposit, hydrological, and climate-related predictors. A calibrated tree-based model was used to estimate relative shallow landslide probability.
+The model is evaluated using a held-out test set and spatial cross-validation to assess geographical generalisation.
 
-Flood was represented as a municipal exposure indicator rather than a probabilistic flood forecast.
+**Held-out test performance**
 
-The final multi-hazard index combines min-max normalised landslide probability and flood exposure into a relative screening measure.
+| Model | ROC-AUC | Average Precision | Brier Score |
+|---|---:|---:|---:|
+| Dummy | 0.500 | 0.901 | 0.089 |
+| Logistic Regression | 0.732 | 0.962 | 0.094 |
+| Calibrated HGB | **0.815** | **0.974** | **0.075** |
 
-Model interpretation was supported by local feature contribution analysis, and the dashboard includes plain-language summaries built from already computed outputs.
+Spatial cross-validation indicates substantial variation in model performance across geographical regions.
 
-## Dashboard features
+The estimates are intended for relative screening, not as annual landslide occurrence probabilities.
 
-The Streamlit app allows the user to:
+### 2. Flood Exposure Assessment
 
-- view landslide probability, flood exposure, or relative multi-hazard index on a map
-- select a municipality
-- inspect model factors that pushed the landslide estimate upward or downward
-- read a plain-language summary for the selected municipality
+Flood exposure is calculated from the geographical overlap between municipality areas and mapped NVE flood caution zones.
 
-## Repository structure
+The revised calculation addresses overlapping flood polygons to avoid double-counting the same land area.
+
+Flood exposure is expressed in per mille (‰) of the municipal land and freshwater area.
+
+The corrected dataset has a maximum observed exposure of **431.894‰**.
+
+Unlike landslide probability, this indicator represents mapped spatial exposure, not the probability of a future flood event.
+
+### 3. Multi-Hazard Index
+
+The relative Multi-Hazard Index (MHI) combines:
+
+- Calibrated shallow landslide probability
+- Corrected flood-zone exposure
+
+Both components are min–max normalised and combined with equal weights.
+
+The resulting index supports relative comparisons between municipalities. It should not be interpreted as a joint disaster probability or comprehensive risk assessment.
+
+### 4. Model Explainability
+
+SHAP is used to investigate feature contributions to an independently trained, uncalibrated HGB model.
+
+Global explanations illustrate which environmental features are most influential, while local explanations identify features associated with higher or lower model outputs for individual municipalities.
+
+These explanations describe model behaviour rather than causal relationships.
+
+Precomputed plain-language summaries make the results more accessible to non-technical users. The dashboard displays saved summaries without requiring a live LLM request for each visitor.
+
+## Interactive Dashboard
+
+The Streamlit application provides three interactive map layers:
+
+| Map | Description |
+|---|---|
+| Landslide Probability | Calibrated municipality-level model estimates |
+| Flood Exposure | Corrected mapped flood-zone exposure (‰) |
+| Multi-Hazard Index | Combined relative screening index |
+
+Users can select a municipality to explore its environmental screening results, view relevant model feature contributions, and read a plain-language interpretation.
+
+Map visualisations use the final revised results. The two municipalities excluded from landslide modelling have no landslide or MHI estimates rather than imputed values.
+
+## Repository Structure
+
+The updated project uses the following principal files:
 
 ```text
 .
@@ -54,55 +98,71 @@ The Streamlit app allows the user to:
 ├── requirements.txt
 ├── README.md
 ├── .gitignore
-├── data/
-│   ├── interim/
-│   │   ├── flood_feature.parquet
-│   │   ├── hydrology.parquet
-│   │   ├── model_dataset_loss_elev_slp_yi.parquet
-│   │   ├── model_features_clean.parquet
-│   │   ├── multihazard.parquet
-│   │   ├── municipalities_climate.parquet
-│   │   └── precipitations_municipalities.parquet
-│   ├── df_mhi_with_llm.parquet
-│   └── municipalities_master.gpkg
+├── feature_labels.py
+├── generate_nik_summaries.py
 ├── notebooks/
-│   └── bachelor_multihazard_workflow.ipynb
+│   └── NIK_2026_final_GitHub.ipynb
+├── data/
+│   └── interim/
+│       └── municipalities_land_pipeline_final.gpkg
+└── results/
+    ├── mhi_pipeline_final_355.csv
+    ├── flood_exposure_corrected_2026.csv
+    ├── municipality_explanations_final.csv
+    └── municipality_llm_summaries_final.csv
 ```
-The data/interim/ folder contains intermediate processed datasets used during feature construction and modelling workflow development.
 
+The notebook also uses additional intermediate modelling datasets and source geospatial files. Some large source data may not be included in the public repository.
 
-## How to run locally
+## Running the Dashboard Locally
 
-Create and activate a virtual environment if needed, then install dependencies:
+Clone the repository and navigate to the project directory.
+
+Install the required dependencies:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Run the dashboard:
+Run the application:
+
 ```bash
 streamlit run app.py
 ```
 
-## Data notes
+The dashboard reads precomputed results, so retraining the machine learning models or regenerating language-model summaries is not required for ordinary dashboard use.
 
-This repository uses processed project outputs for the dashboard. Some large raw source datasets may be excluded from the repository because of file size.
+## Data Sources
 
-Core source families used in the project include:
+The research integrates environmental and administrative data from Norwegian public data providers, including:
 
-- Kartverket municipality boundaries and terrain data
-- NVE landslide and flood-related data
-- NGU surface deposit data
-- seNorge climate data
-- Important interpretation note
+- **NVE:** Landslide and flood-related geospatial data
+- **NGU:** Surface deposit and geological data
+- **Kartverket:** Municipality boundaries and geographical information
+- **SSB:** Municipality area statistics
+- **seNorge:** Climate and precipitation data
 
-The dashboard is a screening tool. It does not provide event prediction, return periods, or official risk decisions. The results should be interpreted as relative model-based patterns at municipality level.
+Data processing, feature construction, and modelling are documented in the research workflow.
 
+## Limitations
+
+This project is an exploratory research and screening tool.
+
+The estimated landslide probabilities are not annual event probabilities. Mapped flood exposure does not represent a probabilistic flood forecast, and MHI is not an absolute risk score.
+
+Spatial validation demonstrates limitations in geographical generalisation. Model feature contributions should not be interpreted as evidence of causality.
+
+The dashboard does not replace official hazard assessments or site-specific geological investigations.
+
+## Research
+
+**Explainable Municipal Multi-Hazard Screening for Shallow Landslides and Floods in Norway**
+
+Research manuscript prepared for NIK 2026.
 
 ## Author
 
-Anastasia Alyoshkina
+**Anastasia Alyoshkina**
 
-Bachelor project in Applied Data Science
-
-Noroff University College
+Bachelor of Applied Data Science  
+Noroff University College, Norway

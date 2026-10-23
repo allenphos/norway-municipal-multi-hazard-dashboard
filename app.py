@@ -1,11 +1,13 @@
-import json
+import html
 from pathlib import Path
 
 import geopandas as gpd
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from openai import OpenAI
+
+from nik_feature_labels import humanize_feature_text
 
 # =========================
 # PAGE CONFIG
@@ -19,39 +21,22 @@ st.set_page_config(
 # =========================
 # CONFIG
 # =========================
-DATA_FILE = "data/df_mhi_with_llm.parquet"
-GPKG_FILE = "data/municipalities_master.gpkg"
+# Files exported by the final NIK 2026 notebook (Sections 5, 7, and 9).
+# Do not use the old df_mhi_with_llm.parquet for hazard values.
+DATA_FILE = "results/mhi_pipeline_final_355.csv"
+FLOOD_FILE = "results/flood_exposure_corrected_2026.csv"
+GPKG_FILE = "data/interim/municipalities_land_pipeline_final.gpkg"
+
+# Optional explanations, only if recomputed using the final analysis.
+# Never silently merge the legacy df_mhi_with_llm.parquet summaries.
+EXPLANATIONS_FILE = "results/municipality_explanations_final.csv"
+SUMMARIES_FILE = "results/municipality_llm_summaries_final.csv"
 GPKG_LAYER = None
-CREDS_FILE = "creds.json"
-
-MODEL_NAME = "gpt-5.4-mini"
-
 MAP_MODE_OPTIONS = {
     "Landslide probability": "landslide_prob_noflood",
-    "Flood exposure": "flood_permille_clean",
+    "Flood exposure": "flood_permille_final",
     "Multi-hazard index": "mhi"
 }
-
-# =========================
-# OPENAI CLIENT
-# =========================
-
-
-def load_openai_client():
-    if not Path(CREDS_FILE).exists():
-        return None
-
-    with open(CREDS_FILE, "r", encoding="utf-8") as f:
-        creds = json.load(f)
-
-    api_key = creds.get("OPENAI_API_KEY")
-    if not api_key:
-        return None
-
-    return OpenAI(api_key=api_key)
-
-
-client = load_openai_client()
 
 # =========================
 # HELPERS
@@ -104,11 +89,15 @@ def mhi_band(v: float) -> str:
 def flood_band(v: float) -> str:
     if pd.isna(v):
         return "Missing"
-    if v >= 0.50:
-        return "Relatively elevated"
-    if v >= 0.10:
-        return "Moderate"
-    return "Low"
+    if v > 300:
+        return ">300‰"
+    if v > 200:
+        return "200–300‰"
+    if v > 100:
+        return "100–200‰"
+    if v > 50:
+        return "50–100‰"
+    return "0–50‰"
 
 
 def simplify_geom(gdf: gpd.GeoDataFrame, tolerance: float = 0.001) -> gpd.GeoDataFrame:
@@ -141,7 +130,7 @@ def build_geojson(gdf: gpd.GeoDataFrame) -> dict:
                 "kommunenavn": row.get("kommunenavn"),
                 "kommunenummer": row.get("kommunenummer"),
                 "landslide_prob_noflood": None if pd.isna(row.get("landslide_prob_noflood")) else float(row.get("landslide_prob_noflood")),
-                "flood_permille_clean": None if pd.isna(row.get("flood_permille_clean")) else float(row.get("flood_permille_clean")),
+                "flood_permille_final": None if pd.isna(row.get("flood_permille_final")) else float(row.get("flood_permille_final")),
                 "mhi": None if pd.isna(row.get("mhi")) else float(row.get("mhi")),
             }
         }
@@ -164,89 +153,6 @@ def get_bounds_center(gdf: gpd.GeoDataFrame):
     return center_lon, center_lat, lon_span, lat_span
 
 
-def build_single_prompt(row: pd.Series) -> str:
-    prob = None if pd.isna(row["landslide_prob_noflood"]) else round(
-        float(row["landslide_prob_noflood"]), 3)
-    flood = None if pd.isna(row["flood_permille_clean"]) else round(
-        float(row["flood_permille_clean"]), 3)
-    mhi = None if pd.isna(row["mhi"]) else round(float(row["mhi"]), 3)
-
-    top_pos = row.get("top_positive_shap", "Not available")
-    top_neg = row.get("top_negative_shap", "Not available")
-
-    landslide_level = prob_band(prob) if prob is not None else "Missing"
-    flood_level = flood_band(flood) if flood is not None else "Missing"
-    mhi_level = mhi_band(mhi) if mhi is not None else "Missing"
-
-    return f"""
-Municipality: {row['kommunenavn']}
-Municipality number: {row['kommunenummer']}
-
-Landslide probability value: {prob}
-Landslide probability level: {landslide_level}
-
-Flood exposure value (‰ of municipal area): {flood}
-Flood exposure level: {flood_level}
-
-Relative multi-hazard index value: {mhi}
-Relative multi-hazard index level: {mhi_level}
-
-Top positive local model contributors:
-{top_pos}
-
-Top negative local model contributors:
-{top_neg}
-
-Return valid JSON with exactly these keys:
-- municipality
-- summary
-
-Rules for summary:
-- Maximum 3 short sentences.
-- Start with the municipality name.
-- Use the qualitative levels above, not only the raw numbers.
-- Prefer phrases like "high model-based landslide probability estimate", "low flood exposure", or "moderately high combined level".
-- Explain the main model factors in simple language.
-- Do not use the word SHAP.
-- Do not add outside facts.
-- Do not claim causality.
-- Do not say that a landslide will happen.
-- Keep the wording suitable for a public-facing dashboard.
-""".strip()
-
-def generate_llm_summary(row: pd.Series) -> str:
-    if client is None:
-        return "OpenAI client is not configured."
-
-    prompt = build_single_prompt(row)
-
-    instructions = """
-    You are assisting a Norway municipal multi-hazard dashboard.
-Use only the provided values and qualitative levels.
-Prefer plain-language interpretation over repeating raw numbers.
-Do not add outside facts.
-Do not claim causality.
-Do not mention future trends.
-Do not use the word SHAP.
-Output valid JSON only.
-    """.strip()
-
-    response = client.responses.create(
-        model=MODEL_NAME,
-        instructions=instructions,
-        input=prompt,
-        max_output_tokens=220
-    )
-
-    raw = response.output_text.strip()
-
-    try:
-        parsed = json.loads(raw)
-        return parsed.get("summary", raw)
-    except Exception:
-        return raw
-
-
 def landslide_plain_language(p: float) -> str:
     if pd.isna(p):
         return "No landslide estimate is available for this municipality."
@@ -261,68 +167,222 @@ def landslide_plain_language(p: float) -> str:
 
 def flood_plain_language(v: float) -> str:
     if pd.isna(v):
-        return "No flood exposure value is available."
-    if v >= 0.12:
-        return "Flood exposure is relatively elevated compared with many other municipalities."
-    if v >= 0.06:
-        return "Flood exposure is moderate."
-    if v > 0:
-        return "Flood exposure is present, but relatively low."
-    return "No mapped overlap with flood caution areas is shown here."
+        return "No corrected flood exposure value is available."
+    if v == 0:
+        return "No mapped overlap with flood caution areas in this dataset."
+    return (f"Mapped flood-zone exposure: {v:.3f}‰ of municipal area "
+            f"({flood_band(v)} class). This is not a flood probability.")
 
 
 # =========================
-# LOAD DATA
+# LOAD DATA: ONE CANONICAL FINAL SOURCE
 # =========================
-if not Path(DATA_FILE).exists():
-    st.error(f"Data file not found: {DATA_FILE}")
+required_paths = [DATA_FILE, FLOOD_FILE, GPKG_FILE]
+missing_paths = [path for path in required_paths if not Path(path).exists()]
+if missing_paths:
+    st.error("Required final NIK 2026 exports are missing: " + ", ".join(missing_paths))
+    st.info(
+        "Run Sections 5, 7 and 9 of NIK_2026_final_GitHub_publication_style.ipynb "
+        "and copy the exported CSV/GeoPackage files into these paths. "
+        "Old flood_permille_clean data cannot be substituted."
+    )
     st.stop()
 
-if not Path(GPKG_FILE).exists():
-    st.error(f"GeoPackage file not found: {GPKG_FILE}")
+
+def normalize_ids(frame):
+    frame = frame.copy()
+    frame["kommunenummer"] = (
+        frame["kommunenummer"].astype("string").str.strip()
+        .str.replace(r"\.0$", "", regex=True).str.zfill(4)
+    )
+    if frame["kommunenummer"].isna().any() or frame["kommunenummer"].duplicated().any():
+        raise ValueError("Null or duplicated municipality IDs in a final input")
+    return frame
+
+
+@st.cache_data(show_spinner=False)
+def load_final_data(explanations_version, summaries_version):
+    model_data = normalize_ids(load_tabular_data(DATA_FILE))
+    flood_data = normalize_ids(load_tabular_data(FLOOD_FILE))
+    geometry = normalize_ids(load_geometries(GPKG_FILE, layer=GPKG_LAYER))
+
+    if len(model_data) != 355 or len(flood_data) != 357 or len(geometry) != 357:
+        raise ValueError(
+            "Unexpected municipality counts: expected 355 modelled, "
+            "357 flood and 357 geometries; got "
+            f"{len(model_data)}, {len(flood_data)}, {len(geometry)}"
+        )
+
+    for field in ("landslide_prob_noflood", "mhi"):
+        if field not in model_data.columns:
+            raise ValueError(f"Missing {field} in {DATA_FILE}")
+    if "flood_permille_final" not in flood_data.columns:
+        raise ValueError(f"Missing corrected flood_permille_final in {FLOOD_FILE}")
+    if "kommunenavn" not in flood_data.columns:
+        raise ValueError("Corrected flood CSV needs kommunenavn")
+    if geometry.crs is None:
+        raise ValueError("Map GeoPackage has no CRS")
+
+    # Geometry exported by the notebook already has older value columns.
+    # Drop those columns and always join freshly exported final numbers.
+    geometry = geometry[["kommunenummer", "geometry"]].copy()
+    flood_data["flood_permille_final"] = pd.to_numeric(
+        flood_data["flood_permille_final"], errors="raise"
+    )
+    model_data["landslide_prob_noflood"] = pd.to_numeric(
+        model_data["landslide_prob_noflood"], errors="raise"
+    )
+    model_data["mhi"] = pd.to_numeric(model_data["mhi"], errors="raise")
+
+    if flood_data["flood_permille_final"].isna().any():
+        raise ValueError("Missing corrected flood exposure values")
+    if not model_data[["landslide_prob_noflood", "mhi"]].notna().all().all():
+        raise ValueError("Missing landslide or MHI values in the final modelling output")
+    if not model_data["landslide_prob_noflood"].between(0, 1).all():
+        raise ValueError("Landslide probabilities outside [0, 1]")
+    if not model_data["mhi"].between(0, 1).all():
+        raise ValueError("Relative MHI values outside [0, 1]")
+    if set(geometry["kommunenummer"]) != set(flood_data["kommunenummer"]):
+        raise ValueError("Flood and map geometries have different municipality IDs")
+    if set(model_data["kommunenummer"]) != set(flood_data["kommunenummer"]) - {"1856", "1144"}:
+        raise ValueError("Modelled municipality IDs do not match the two documented exclusions")
+
+    # The final MHI output also contains flood_permille_final. Confirm it
+    # matches the separately exported 357-municipality flood audit exactly.
+    if "flood_permille_final" in model_data.columns:
+        comparison = model_data[["kommunenummer", "flood_permille_final"]].merge(
+            flood_data[["kommunenummer", "flood_permille_final"]],
+            on="kommunenummer", validate="one_to_one", suffixes=("_mhi", "_flood")
+        )
+        if not np.allclose(
+            comparison["flood_permille_final_mhi"].astype(float),
+            comparison["flood_permille_final_flood"].astype(float),
+            rtol=0, atol=1e-6
+        ):
+            raise ValueError("MHI and corrected flood CSVs contain different flood values")
+
+    if not np.isclose(flood_data["flood_permille_final"].max(), 431.894, atol=0.015):
+        raise ValueError(
+            "The corrected flood data do not match the NIK 2026 maximum "
+            "of 431.894‰; verify the exported file before publishing."
+        )
+
+    merged = geometry.merge(
+        flood_data[["kommunenummer", "kommunenavn", "flood_permille_final"]],
+        on="kommunenummer", how="left", validate="one_to_one"
+    ).merge(
+        model_data[["kommunenummer", "landslide_prob_noflood", "mhi"]],
+        on="kommunenummer", how="left", validate="one_to_one"
+    )
+    if len(merged) != 357:
+        raise ValueError("Geometry merge changed municipality count")
+    if (merged["flood_permille_final"].notna().sum() != 357
+            or merged["landslide_prob_noflood"].notna().sum() != 355
+            or merged["mhi"].notna().sum() != 355):
+        raise ValueError("Final hazard values could not be matched by municipality ID")
+
+    # Optional *updated* local explanations. Do not import outdated summaries
+    # from the old data/df_mhi_with_llm.parquet file.
+    if Path(EXPLANATIONS_FILE).exists():
+        explanations = normalize_ids(load_tabular_data(EXPLANATIONS_FILE))
+        extra_cols = [c for c in (
+            "top_positive_shap", "top_negative_shap", "llm_summary",
+            "llm_caution_flag", "llm_parse_ok", "llm_model_used"
+        ) if c in explanations.columns]
+        if extra_cols:
+            if explanations["kommunenummer"].duplicated().any():
+                raise ValueError("Duplicate municipality IDs in local SHAP file")
+            if not set(explanations["kommunenummer"]) == set(model_data["kommunenummer"]):
+                raise ValueError("Local SHAP IDs do not match the final 355 municipalities")
+            merged = merged.merge(
+                explanations[["kommunenummer", *extra_cols]],
+                on="kommunenummer", how="left", validate="one_to_one"
+            )
+
+    # Summaries were pre-generated once via generate_nik_summaries.py.
+    # The public dashboard NEVER calls a paid API.
+    if Path(SUMMARIES_FILE).exists():
+        summaries = normalize_ids(pd.read_csv(
+            SUMMARIES_FILE, dtype={"kommunenummer": "string"}, keep_default_na=False
+        ))
+        expected_cols = {
+            "kommunenummer", "llm_summary",
+            "landslide_prob_noflood_source", "flood_permille_final_source", "mhi_source",
+            "top_positive_shap_source", "top_negative_shap_source",
+        }
+        if expected_cols - set(summaries.columns):
+            raise ValueError("Cached summaries CSV has missing provenance columns: "
+                             + ", ".join(sorted(expected_cols - set(summaries.columns))))
+        if not set(summaries["kommunenummer"]).issubset(set(model_data["kommunenummer"])):
+            raise ValueError("Cached summary CSV includes unexpected municipality IDs")
+        if summaries["llm_summary"].eq("").any():
+            raise ValueError("Cached summary CSV contains blank summaries")
+        # Ensure cached text belongs to exactly these numerical inputs.
+        reference = merged.set_index("kommunenummer")
+        check = summaries.set_index("kommunenummer")
+        for source_col, final_col in (
+            ("landslide_prob_noflood_source", "landslide_prob_noflood"),
+            ("flood_permille_final_source", "flood_permille_final"),
+            ("mhi_source", "mhi"),
+        ):
+            actual = pd.to_numeric(check[source_col], errors="raise").to_numpy()
+            expected = reference.loc[check.index, final_col].astype(float).to_numpy()
+            if not np.allclose(actual, expected, rtol=0, atol=1e-9):
+                raise ValueError(
+                    f"Stale cached summaries: {source_col} differs from the final hazard CSV. "
+                    "Rerun generate_nik_summaries.py before publishing."
+                )
+        # SHAP provenance matters: a changed explanation must not silently
+        # retain the wording generated for a previous fitted model.
+        for source_col, final_col in (
+            ("top_positive_shap_source", "top_positive_shap"),
+            ("top_negative_shap_source", "top_negative_shap"),
+        ):
+            if final_col not in reference:
+                raise ValueError(
+                    "Cached AI explanations need results/municipality_explanations_final.csv "
+                    "for model provenance verification."
+                )
+            actual = check[source_col].fillna("").astype(str).tolist()
+            expected = reference.loc[check.index, final_col].fillna("").astype(str).tolist()
+            if actual != expected:
+                raise ValueError(
+                    "Cached summaries do not match the final SHAP features. "
+                    "Regenerate changed rows before publishing."
+                )
+        merged = merged.merge(
+            summaries[["kommunenummer", "llm_summary"]],
+            on="kommunenummer", how="left", validate="one_to_one"
+        )
+
+    return gpd.GeoDataFrame(merged, geometry="geometry", crs=geometry.crs)
+
+
+try:
+    # Cache refreshes when either optional explanation CSV is created/updated.
+    explanation_version = (Path(EXPLANATIONS_FILE).stat().st_mtime_ns
+                           if Path(EXPLANATIONS_FILE).exists() else None)
+    summaries_version = (Path(SUMMARIES_FILE).stat().st_mtime_ns
+                         if Path(SUMMARIES_FILE).exists() else None)
+    gdf_map = load_final_data(explanation_version, summaries_version)
+    # Simplify in projected metres, preserving topology (only map geometry,
+    # never model features or municipality identifiers).
+    if gdf_map.crs.is_projected:
+        gdf_map["geometry"] = gdf_map.geometry.simplify(
+            tolerance=70, preserve_topology=True
+        )
+    gdf_map = gdf_map.to_crs(epsg=4326)
+    gdf_map = fix_geometry_for_webmap(gdf_map)
+except Exception as exc:
+    st.error(f"Cannot load final map data: {exc}")
     st.stop()
 
-df = load_tabular_data(DATA_FILE)
-gdf = load_geometries(GPKG_FILE, layer=GPKG_LAYER)
+if len(gdf_map) != 357:
+    st.error("One or more municipal geometries are missing after validation")
+    st.stop()
 
-df["kommunenummer"] = df["kommunenummer"].astype(str).str.strip().str.zfill(4)
-
-if "kommunenavn" in df.columns:
-    df["kommunenavn"] = df["kommunenavn"].astype(str)
-
-cols_to_merge = [
-    "kommunenummer",
-    "kommunenavn",
-    "landslide_prob_noflood",
-    "flood_permille_clean",
-    "mhi",
-    "top_positive_shap",
-    "top_negative_shap",
-    "llm_summary",
-    "llm_caution_flag",
-    "llm_parse_ok",
-    "llm_model_used"
-]
-
-df_small = df[[c for c in cols_to_merge if c in df.columns]].copy()
-
-gdf_map = gdf.to_crs(epsg=4326).copy()
-#gdf_map = simplify_geom(gdf_map, tolerance=0.001)
-gdf_map = gdf_map.merge(df_small, on="kommunenummer", how="left")
-
-if "kommunenavn_x" in gdf_map.columns and "kommunenavn_y" in gdf_map.columns:
-    gdf_map["kommunenavn"] = gdf_map["kommunenavn_y"].combine_first(
-        gdf_map["kommunenavn_x"])
-    gdf_map.drop(columns=["kommunenavn_x", "kommunenavn_y"], inplace=True)
-elif "kommunenavn_x" in gdf_map.columns:
-    gdf_map.rename(columns={"kommunenavn_x": "kommunenavn"}, inplace=True)
-elif "kommunenavn_y" in gdf_map.columns:
-    gdf_map.rename(columns={"kommunenavn_y": "kommunenavn"}, inplace=True)
-
-gdf_map = gdf_map[gdf_map["kommunenavn"].notna()].copy()
 gdf_map = gdf_map.reset_index(drop=True)
-gdf_map["plot_id"] = gdf_map.index.astype(str)
-gdf_map = fix_geometry_for_webmap(gdf_map)
+gdf_map["plot_id"] = gdf_map["kommunenummer"]  # stable across reruns
 
 # =========================
 # SIDEBAR
@@ -363,231 +423,134 @@ st.caption(
 )
 
 # =========================
-# MAP DATA
+# MAP DATA: PUBLICATION-STYLE COLOURS AND CLASSES
 # =========================
-map_cols = [
-    "plot_id",
-    "kommunenummer",
-    "kommunenavn",
-    "landslide_prob_noflood",
-    "flood_permille_clean",
-    "mhi",
-    "geometry"
-]
+plot_df = gdf_map[[
+    "plot_id", "kommunenummer", "kommunenavn",
+    "landslide_prob_noflood", "flood_permille_final", "mhi", "geometry"
+]].copy()
 
-plot_df = gdf_map[map_cols].copy()
-geojson_data = build_geojson(plot_df)
+# Flood: fixed exposure bins, exactly as in the final paper-style figure.
+FLOOD_LABELS = ["0–50‰", "50–100‰", "100–200‰", "200–300‰", ">300‰"]
+FLOOD_COLOURS = ["#eff5fa", "#c3d9ee", "#6baed6", "#2171b5", "#08306b"]
 
-# -------- Flood classes --------
-flood_max = plot_df["flood_permille_clean"].max()
-if pd.isna(flood_max):
-    flood_max = 0.12
+# Landslide and MHI: quintiles recomputed from the final observed values.
+# These colour scales follow the supplied NIK 2026 map examples.
+LANDSLIDE_COLOURS = ["#eeecf5", "#bfbedd", "#958fc3", "#6e5aa8", "#4b198b"]
+MHI_COLOURS = ["#fff7ec", "#fdd49e", "#fc8d59", "#d7301f", "#7f0000"]
 
+
+def quintile_classification(values, palette, indicator):
+    observed = values.dropna().astype(float)
+    edges = np.unique(np.quantile(observed, np.linspace(0, 1, 6)))
+    if len(edges) < 3:
+        raise ValueError(f"{indicator}: insufficient distinct values for a quantile map")
+    class_count = len(edges) - 1
+    codes = pd.cut(values, bins=edges, include_lowest=True, labels=False)
+    # If quintile edges coincide, do not arbitrarily split ties.
+    colour_indices = np.linspace(0, len(palette) - 1, class_count).round().astype(int)
+    colours = [palette[i] for i in colour_indices]
+    return codes, edges, colours
+
+
+plot_df["ls_class"], ls_edges, ls_colours = quintile_classification(
+    plot_df["landslide_prob_noflood"], LANDSLIDE_COLOURS, "Landslide probability"
+)
+plot_df["mhi_class"], mhi_edges, mhi_colours = quintile_classification(
+    plot_df["mhi"], MHI_COLOURS, "MHI"
+)
 plot_df["flood_class"] = pd.cut(
-    plot_df["flood_permille_clean"],
-    bins=[-0.000001, 0, 0.03, 0.04, 0.06, 0.12, flood_max + 1e-9],
-    labels=[
-        "0 (no overlap)",
-        "0–0.03 ‰",
-        "0.03–0.04 ‰",
-        "0.04–0.06 ‰",
-        "0.06–0.12 ‰",
-        "0.12+ ‰"
-    ],
-    include_lowest=True
+    plot_df["flood_permille_final"],
+    bins=[-np.inf, 50, 100, 200, 300, np.inf],
+    labels=False, include_lowest=True
 )
 
-flood_color_map = {
-    "0 (no overlap)": "#f2f2f2",
-    "0–0.03 ‰": "#dfe3f0",
-    "0.03–0.04 ‰": "#c7cceb",
-    "0.04–0.06 ‰": "#9ea5e5",
-    "0.06–0.12 ‰": "#6b73d6",
-    "0.12+ ‰": "#3f47b7"
-}
+if map_col == "landslide_prob_noflood":
+    class_col = "ls_class"
+    legend = [
+        (f"Q{i + 1}: {ls_edges[i]:.4f}–{ls_edges[i + 1]:.4f}", colour)
+        for i, colour in enumerate(ls_colours)
+    ]
+    map_note = "Modelled municipality-level relative screening; not annual landslide event probability."
+elif map_col == "flood_permille_final":
+    class_col = "flood_class"
+    legend = list(zip(FLOOD_LABELS, FLOOD_COLOURS))
+    map_note = "NVE flood caution-zone area as ‰ of municipal area; not flood probability."
+else:
+    class_col = "mhi_class"
+    if len(mhi_colours) == 5:
+        mhi_labels = ["Lowest 20%", "20–40%", "40–60%", "60–80%", "Highest 20%"]
+    else:
+        mhi_labels = [f"Q{i + 1}" for i in range(len(mhi_colours))]
+    legend = list(zip(mhi_labels, mhi_colours))
+    map_note = "Equal-weight, min–max-normalised MHI; a relative index, not joint hazard probability."
 
-# -------- Landslide classes --------
-landslide_max = plot_df["landslide_prob_noflood"].max()
-if pd.isna(landslide_max):
-    landslide_max = 0.97
-
-plot_df["landslide_class"] = pd.cut(
-    plot_df["landslide_prob_noflood"],
-    bins=[0.33, 0.80, 0.90, 0.95, 0.96, 0.97, landslide_max + 1e-9],
-    labels=[
-        "0.33–0.80",
-        "0.80–0.90",
-        "0.90–0.95",
-        "0.95–0.96",
-        "0.96–0.97",
-        "0.97+"
-    ],
-    include_lowest=True
-)
-
-plot_df["landslide_class"] = plot_df["landslide_class"].astype("object")
-plot_df.loc[plot_df["landslide_prob_noflood"].isna(), "landslide_class"] = "Missing / excluded"
-
-landslide_color_map = {
-    "0.33–0.80": "#f6ead7",
-    "0.80–0.90": "#f6c98b",
-    "0.90–0.95": "#fb8d52",
-    "0.95–0.96": "#e5371f",
-    "0.96–0.97": "#8e0000",
-    "0.97+": "#5c0000",
-    "Missing / excluded": "#c9c9c9"
-}
-
-# -------- MHI classes --------
-mhi_max = plot_df["mhi"].max()
-if pd.isna(mhi_max):
-    mhi_max = 0.65
-
-plot_df["mhi_class"] = pd.cut(
-    plot_df["mhi"],
-    bins=[0, 0.20, 0.35, 0.50, 0.65, mhi_max + 1e-9],
-    labels=[
-        "0.00–0.20",
-        "0.20–0.35",
-        "0.35–0.50",
-        "0.50–0.65",
-        "0.65+"
-    ],
-    include_lowest=True
-)
-
-plot_df["mhi_class"] = plot_df["mhi_class"].astype("object")
-plot_df.loc[plot_df["mhi"].isna(), "mhi_class"] = "Missing"
-
-mhi_color_map = {
-    "0.00–0.20": "#f6ead7",
-    "0.20–0.35": "#f3c98b",
-    "0.35–0.50": "#f58d52",
-    "0.50–0.65": "#e5371f",
-    "0.65+": "#8e0000",
-    "Missing": "#c9c9c9"
-}
-
-selected_outline = plot_df[plot_df["kommunenavn"] == st.session_state["selected_muni"]].copy()
+# White gaps are intentional: two excluded municipalities have no modelled
+# landslide/MHI values. Do not draw a grey base layer or a missing-value class.
+selected_outline = plot_df.loc[
+    (plot_df["kommunenavn"] == st.session_state["selected_muni"])
+    & plot_df[map_col].notna()
+].copy()
 
 # =========================
-# BUILD MAP
+# INTERACTIVE CHOROPLETH
 # =========================
 fig = go.Figure()
 
-if map_col == "landslide_prob_noflood":
-    class_order = [
-        "0.33–0.80",
-        "0.80–0.90",
-        "0.90–0.95",
-        "0.95–0.96",
-        "0.96–0.97",
-        "0.97+",
-        "Missing / excluded"
-    ]
-    class_col = "landslide_class"
-    color_map = landslide_color_map
-    line_color = "#8c8c8c"
-
-elif map_col == "flood_permille_clean":
-    class_order = [
-        "0 (no overlap)",
-        "0–0.03 ‰",
-        "0.03–0.04 ‰",
-        "0.04–0.06 ‰",
-        "0.06–0.12 ‰",
-        "0.12+ ‰"
-    ]
-    class_col = "flood_class"
-    color_map = flood_color_map
-    line_color = "#8c8c8c"
-
-else:
-    class_order = [
-        "0.00–0.20",
-        "0.20–0.35",
-        "0.35–0.50",
-        "0.50–0.65",
-        "0.65+",
-        "Missing"
-    ]
-    class_col = "mhi_class"
-    color_map = mhi_color_map
-    line_color = "#8c8c8c"
-
-for cls in class_order:
-    class_df = plot_df[plot_df[class_col] == cls].copy()
+for class_number, (legend_label, colour) in enumerate(legend):
+    class_df = plot_df.loc[plot_df[class_col] == class_number].copy()
     if class_df.empty:
         continue
-
-    class_geojson = build_geojson(class_df)
-
-    fig.add_trace(
-        go.Choropleth(
-            geojson=class_geojson,
-            locations=class_df["plot_id"],
-            z=[1] * len(class_df),
-            featureidkey="properties.plot_id",
-            customdata=class_df[
-                [
-                    "kommunenavn",
-                    "kommunenummer",
-                    "landslide_prob_noflood",
-                    "flood_permille_clean",
-                    "mhi"
-                ]
-            ],
-            colorscale=[[0, color_map[cls]], [1, color_map[cls]]],
-            showscale=False,
-            name=cls,
-            showlegend=False,
-            marker_line_width=0.45,
-            marker_line_color=line_color,
-            hovertemplate=(
-                "<b>%{customdata[0]}</b><br>"
-                "Municipality no.: %{customdata[1]}<br>"
-                "Landslide probability: %{customdata[2]:.3f}<br>"
-                "Flood exposure: %{customdata[3]:.3f}<br>"
-                "Relative MHI: %{customdata[4]:.3f}<extra></extra>"
-            )
+    fig.add_trace(go.Choropleth(
+        geojson=build_geojson(class_df),
+        locations=class_df["plot_id"],
+        z=np.ones(len(class_df)),
+        featureidkey="properties.plot_id",
+        customdata=class_df[[
+            "kommunenavn", "kommunenummer", "landslide_prob_noflood",
+            "flood_permille_final", "mhi"
+        ]].to_numpy(),
+        colorscale=[[0, colour], [1, colour]],
+        showscale=False, showlegend=False,
+        name=legend_label,
+        marker_line_width=0.20,
+        marker_line_color="#ffffff",
+        hovertemplate=(
+            "<b>%{customdata[0]}</b><br>"
+            "Municipality no.: %{customdata[1]}<br>"
+            "Landslide probability: %{customdata[2]:.3f}<br>"
+            "Flood exposure: %{customdata[3]:.3f}‰<br>"
+            "Relative MHI: %{customdata[4]:.3f}<extra></extra>"
         )
-    )
+    ))
 
-# selected municipality outline
 if not selected_outline.empty:
-    selected_geojson = build_geojson(selected_outline)
-
-    fig.add_trace(
-        go.Choropleth(
-            geojson=selected_geojson,
-            locations=selected_outline["plot_id"],
-            z=[1] * len(selected_outline),
-            featureidkey="properties.plot_id",
-            colorscale=[[0, "rgba(0,0,0,0)"], [1, "rgba(0,255,255,0.12)"]],
-            showscale=False,
-            marker_line_width=2.2,
-            marker_line_color="cyan",
-            hoverinfo="skip",
-            name="Selected municipality",
-            showlegend=False
-        )
-    )
+    fig.add_trace(go.Choropleth(
+        geojson=build_geojson(selected_outline),
+        locations=selected_outline["plot_id"],
+        z=np.ones(len(selected_outline)),
+        featureidkey="properties.plot_id",
+        colorscale=[[0, "rgba(0,0,0,0)"], [1, "rgba(0,0,0,0)"]],
+        showscale=False, showlegend=False,
+        marker_line_width=1.7,
+        marker_line_color="#162b45",
+        hoverinfo="skip",
+        name="Selected municipality"
+    ))
 
 fig.update_geos(
-    fitbounds="locations",
-    visible=False,
+    fitbounds="locations", visible=False,
     projection_type="mercator",
-    showcountries=False,
-    showcoastlines=False,
-    showland=True,
-    landcolor="#e6e6e6",
-    bgcolor="#e6e6e6"
+    showcountries=False, showcoastlines=False, showland=False,
+    bgcolor="#ffffff"
 )
-
 fig.update_layout(
-    margin={"r": 0, "t": 0, "l": 0, "b": 0},
-    height=980,
-    showlegend=False
+    margin=dict(l=0, r=0, t=0, b=0),
+    height=850,
+    paper_bgcolor="#ffffff",
+    plot_bgcolor="#ffffff",
+    showlegend=False,
+    dragmode="pan"
 )
 
 # =========================
@@ -597,6 +560,7 @@ left, right = st.columns([2.35, 1])
 
 with left:
     st.subheader(map_label)
+    st.caption(map_note)
 
     event = st.plotly_chart(
         fig,
@@ -632,51 +596,23 @@ selected_row = selected_rows.iloc[0]
 with right:
     st.subheader(st.session_state["selected_muni"])
 
-    # manual legend
-    if map_col == "landslide_prob_noflood":
-        st.markdown("**Relative probability class**")
-        st.markdown("""
-        <div style="line-height:1.9; font-size:15px;">
-            <span style="display:inline-block;width:16px;height:16px;background:#f6ead7;border:1px solid #999;margin-right:8px;"></span>0.33–0.80<br>
-            <span style="display:inline-block;width:16px;height:16px;background:#f6c98b;border:1px solid #999;margin-right:8px;"></span>0.80–0.90<br>
-            <span style="display:inline-block;width:16px;height:16px;background:#fb8d52;border:1px solid #999;margin-right:8px;"></span>0.90–0.95<br>
-            <span style="display:inline-block;width:16px;height:16px;background:#e5371f;border:1px solid #999;margin-right:8px;"></span>0.95–0.96<br>
-            <span style="display:inline-block;width:16px;height:16px;background:#8e0000;border:1px solid #999;margin-right:8px;"></span>0.96–0.97<br>
-            <span style="display:inline-block;width:16px;height:16px;background:#5c0000;border:1px solid #999;margin-right:8px;"></span>0.97+<br>
-            <span style="display:inline-block;width:16px;height:16px;background:#c9c9c9;border:1px solid #999;margin-right:8px;"></span>Missing / excluded
-        </div>
-        """, unsafe_allow_html=True)
-
-    elif map_col == "flood_permille_clean":
-        st.markdown("**Flood exposure class**")
-        st.markdown("""
-        <div style="line-height:1.9; font-size:15px;">
-            <span style="display:inline-block;width:16px;height:16px;background:#f2f2f2;border:1px solid #999;margin-right:8px;"></span>0 (no overlap)<br>
-            <span style="display:inline-block;width:16px;height:16px;background:#dfe3f0;border:1px solid #999;margin-right:8px;"></span>0–0.03 ‰<br>
-            <span style="display:inline-block;width:16px;height:16px;background:#c7cceb;border:1px solid #999;margin-right:8px;"></span>0.03–0.04 ‰<br>
-            <span style="display:inline-block;width:16px;height:16px;background:#9ea5e5;border:1px solid #999;margin-right:8px;"></span>0.04–0.06 ‰<br>
-            <span style="display:inline-block;width:16px;height:16px;background:#6b73d6;border:1px solid #999;margin-right:8px;"></span>0.06–0.12 ‰<br>
-            <span style="display:inline-block;width:16px;height:16px;background:#3f47b7;border:1px solid #999;margin-right:8px;"></span>0.12+ ‰
-        </div>
-        """, unsafe_allow_html=True)
-
-    else:
-        st.markdown("**Relative MHI class**")
-        st.markdown("""
-        <div style="line-height:1.9; font-size:15px;">
-            <span style="display:inline-block;width:16px;height:16px;background:#f6ead7;border:1px solid #999;margin-right:8px;"></span>0.00–0.20<br>
-            <span style="display:inline-block;width:16px;height:16px;background:#f3c98b;border:1px solid #999;margin-right:8px;"></span>0.20–0.35<br>
-            <span style="display:inline-block;width:16px;height:16px;background:#f58d52;border:1px solid #999;margin-right:8px;"></span>0.35–0.50<br>
-            <span style="display:inline-block;width:16px;height:16px;background:#e5371f;border:1px solid #999;margin-right:8px;"></span>0.50–0.65<br>
-            <span style="display:inline-block;width:16px;height:16px;background:#8e0000;border:1px solid #999;margin-right:8px;"></span>0.65+<br>
-            <span style="display:inline-block;width:16px;height:16px;background:#c9c9c9;border:1px solid #999;margin-right:8px;"></span>Missing
-        </div>
-        """, unsafe_allow_html=True)
+    # Legend uses the exact classes/colours that appear on the map.
+    st.markdown("**Map legend**")
+    legend_html = "<div style='line-height:1.9;font-size:14px'>" + "".join(
+        "<div style='display:flex;align-items:center;gap:9px'>"
+        f"<span style='display:inline-block;flex:0 0 16px;height:14px;"
+        f"background:{colour};border:1px solid #d4d4d4'></span>"
+        f"<span>{html.escape(label)}</span></div>"
+        for label, colour in legend
+    ) + "</div>"
+    st.markdown(legend_html, unsafe_allow_html=True)
+    if map_col != "flood_permille_final":
+        st.caption("Unfilled areas: municipalities excluded from modelling (no estimate).")
 
     st.divider()
 
     st.info(landslide_plain_language(selected_row["landslide_prob_noflood"]))
-    st.caption(flood_plain_language(selected_row["flood_permille_clean"]))
+    st.caption(flood_plain_language(selected_row["flood_permille_final"]))
 
     c1, c2 = st.columns(2)
     with c1:
@@ -689,7 +625,7 @@ with right:
             st.caption("Missing")
 
     with c2:
-        flood_val = selected_row.get("flood_permille_clean", None)
+        flood_val = selected_row.get("flood_permille_final", None)
         if pd.notna(flood_val):
             st.metric("Flood exposure (‰)", f"{flood_val:.3f}")
             st.caption(f"{flood_band(flood_val)} flood exposure")
@@ -705,17 +641,27 @@ with right:
         st.metric("Relative MHI", "NA")
         st.caption("Missing")
 
-    with st.expander("Why the landslide estimate looks like this", expanded=True):
-        st.markdown("**What increased the landslide estimate**")
-        st.write(selected_row.get("top_positive_shap", "Not available"))
-
-        st.markdown("**What reduced the landslide estimate**")
-        st.write(selected_row.get("top_negative_shap", "Not available"))
-
-        st.caption(
-            "This section explains which local factors had the strongest influence on the model result "
-            "for this municipality. These are model signals, not proof that a landslide will happen."
-        )
+    with st.expander("Feature contributions (uncalibrated HGB)", expanded=False):
+        # Explanations are obtained from the separately fitted uncalibrated
+        # model in the notebook, not from the calibrated probabilities.
+        positive = selected_row.get("top_positive_shap")
+        negative = selected_row.get("top_negative_shap")
+        if pd.notna(positive) and pd.notna(negative):
+            st.markdown("**Factors increasing the uncalibrated model score**")
+            st.write(humanize_feature_text(positive))
+            st.markdown("**Factors decreasing the uncalibrated model score**")
+            st.write(humanize_feature_text(negative))
+            st.caption(
+                "SHAP explains the separately fitted uncalibrated HGB's model output, "
+                "not the displayed calibrated landslide probability. "
+                "Feature contributions are associations, not causal effects."
+            )
+        else:
+            st.info(
+                "Local SHAP explanations are not available yet. Run the "
+                "municipality-level SHAP export cell in the NIK notebook and "
+                "copy results/municipality_explanations_final.csv into this project."
+            )
         
         
     st.subheader("Explanation")
@@ -723,15 +669,21 @@ with right:
     saved_summary = selected_row.get("llm_summary", None)
 
     if pd.notna(saved_summary) and str(saved_summary).strip():
-        st.info(saved_summary)
+        st.info(humanize_feature_text(saved_summary))
+        st.caption(
+            "Pre-generated explanation using final NIK 2026 values. "
+            "Feature contributions refer to a separate uncalibrated HGB, "
+            "not to the calibrated probability or a causal effect."
+        )
+    elif pd.notna(selected_row.get("landslide_prob_noflood")):
+        st.info(
+            "No cached explanation yet. Generate it once with "
+            "`python generate_nik_summaries.py --all` and add "
+            "`results/municipality_llm_summaries_final.csv` to the project. "
+            "The public dashboard does not call the API."
+        )
     else:
-        if st.button("Generate plain-language summary"):
-            with st.spinner("Generating summary..."):
-                try:
-                    llm_text = generate_llm_summary(selected_row)
-                    st.info(llm_text)
-                except Exception as e:
-                    st.error(f"Generation failed: {e}")
+        st.caption("No modelled landslide value for this excluded municipality.")
 
 if show_data_table:
     st.subheader("Underlying data")
@@ -739,14 +691,20 @@ if show_data_table:
         "kommunenummer",
         "kommunenavn",
         "landslide_prob_noflood",
-        "flood_permille_clean",
+        "flood_permille_final",
         "mhi",
         "top_positive_shap",
         "top_negative_shap",
         "llm_summary"
     ]
     cols = [c for c in cols if c in gdf_map.columns]
-    st.dataframe(gdf_map[cols], use_container_width=True)
+    view = gdf_map[cols].copy()
+    for label_col in ("top_positive_shap", "top_negative_shap", "llm_summary"):
+        if label_col in view.columns:
+            view[label_col] = view[label_col].map(
+                lambda value: humanize_feature_text(value) if pd.notna(value) else value
+            )
+    st.dataframe(view, use_container_width=True)
 
 st.subheader("Additional information")
 st.write("For more detailed information, please see the official maps and source links below.")
